@@ -1,8 +1,11 @@
+import logging as log
+
 from . import gitlab
 
 GET, POST, PUT = gitlab.GET, gitlab.POST, gitlab.PUT
 
 
+# pylint: disable=too-many-branches
 class Approvals(gitlab.Resource):
     """Approval info for a MergeRequest."""
 
@@ -14,11 +17,57 @@ class Approvals(gitlab.Resource):
             # GitLab botched the v4 api before 9.2.3
             approver_url = '/projects/{0.project_id}/merge_requests/{0.id}/approvals'.format(self)
 
-        # Approvals are in CE since 13.2
-        if gitlab_version.is_ee or gitlab_version.release >= (13, 2, 0):
-            self._info = self._api.call(GET(approver_url))
+        if gitlab_version.release >= (13, 2, 0):
+            # 优先查找project设置的approvers
+            gitlab_variables = self._api.call(GET('/projects/{0.project_id}/variables'.format(self)))
+            mr_approvers = next((var['value'] for var in gitlab_variables if var.get('key') ==
+                                'MR_APPROVERS'), '')
+
+            # project没有设置approvers时查找其上级group，层级关系越近优先级越高
+            # 如RD-CFE/RD-CFE-CODE/PTC设置的approvers优先级高于RD-CFE/RD-CFE-CODE
+            if mr_approvers:
+                log.info('Use merge request approvers from project')
+            else:
+                parent_groups = self._api.call(GET('/projects/{0.project_id}/groups'.format(self)))
+                parent_groups.sort(key=lambda x: len(x["full_path"]), reverse=True)
+                for group in parent_groups:
+                    gitlab_variables = self._api.call(GET('/groups/{0}/variables'.format(group['id'])))
+                    mr_approvers = next((var['value'] for var in gitlab_variables if var.get('key') ==
+                                        'MR_APPROVERS'), '')
+                    if mr_approvers:
+                        log.info('Use merge request approvers from parent group: %s', group['web_url'])
+                        break
         else:
-            self._info = dict(self._info, approvals_left=0, approved_by=[])
+            mr_approvers = ''
+
+        if mr_approvers:
+            mr_approvers_list = mr_approvers.split(",")
+
+            approved_by_user_list = []
+            self._info = self._api.call(GET(approver_url))
+            for approve_info in self._info['approved_by']:
+                approved_by_user_list.append(approve_info['user']['username'])
+
+            log.info('Merge request approvers: %s', ', '.join(mr_approvers_list))
+            log.info('Approve users: %s', ', '.join(approved_by_user_list))
+
+            # mr_approvers_list和approved_by_user_list用户有交集时允许mr合入
+            common_user = set(mr_approvers_list) & set(approved_by_user_list)
+            if common_user:
+                self._info = dict(self._info, approvals_left=0, approved_by=[])
+                log.info('Merge request is approved by: %s', str(common_user))
+            else:
+                self._info = dict(self._info, approvals_left=1, approved_by=[])
+                log.info('No common approvers match')
+        else:
+            # Approvals are in CE since 13.2
+            if gitlab_version.is_ee or gitlab_version.release >= (13, 2, 0):
+                self._info = self._api.call(GET(approver_url))
+            else:
+                self._info = dict(self._info, approvals_left=0, approved_by=[])
+
+        # test: always skip merge
+        # self._info = dict(self._info, approvals_left=5, approved_by=[])
 
     @property
     def iid(self):
